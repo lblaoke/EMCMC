@@ -1,7 +1,7 @@
 # Environment requirements
 ```
-python==3.10
-pytorch==1.13.1
+python>=3.8
+pytorch==1.12
 ```
 
 # Command
