@@ -1,28 +1,37 @@
+import os
 import sys
 sys.path.append('.')
 
 import torch
 import numpy as np
-from time import time
-from tqdm import tqdm
+
 import argparse
+from time import time
+from datetime import datetime
+from tqdm import tqdm
+from math import *
+
+import utils
 import data_loader
 import models
-import utils
 import test_eval
 
 # parse options
 parser = argparse.ArgumentParser()
-parser.add_argument('--data-dir'        , type=str  , default='~'       )
-parser.add_argument('--num-class'       , type=int  , default=10        )
-parser.add_argument('--epoch'           , type=int  , default=200       )
-parser.add_argument('--batch-size'      , type=int  , default=128       )
-parser.add_argument('--gpu'             , type=int  , default=0         )
-parser.add_argument('--seed'            , type=int  , default=None      )
-parser.add_argument('--lr0'             , type=float, default=0.5       )
-parser.add_argument('--decay-scheme'    , type=str  , default='cyclical')
-parser.add_argument('--lr-end'          , type=float, default=0         )
-parser.add_argument('--save'            , type=str  , default=None      )
+
+parser.add_argument('--data-dir'        , type=str  , default='~'           )
+parser.add_argument('--save'            , type=str  , default='cifar10_sgd' )
+
+parser.add_argument('--num-class'       , type=int  , default=10            )
+parser.add_argument('--gpu'             , type=int  , default=0             )
+parser.add_argument('--seed'            , type=int  , default=None          )
+
+parser.add_argument('--epoch'           , type=int  , default=200           )
+parser.add_argument('--batch-size'      , type=int  , default=128           )
+parser.add_argument('--lr0'             , type=float, default=0.5           )
+parser.add_argument('--decay-scheme'    , type=str  , default='cyclical'    )
+parser.add_argument('--lr-end'          , type=float, default=0             )
+
 args = parser.parse_args()
 
 # setup GPU
@@ -75,33 +84,29 @@ def train(epoch):
 
     print('Loss: %.3f | ACC: %.3f%% (%d/50000)' % (train_loss/num_batch,100.*correct/50000,correct))
 
-# main loop
+# training loop
 print('==> Training...')
-acc_list = []
+_time = datetime.now()
+path = f'.checkpoints/{args.save}_{_time.year}_{_time.month}_{_time.day}'
+os.system(f'mkdir -p {path}')
 w_list = []
 
-start = time()
+_time = time()
 
 for epoch in range(args.epoch):
     train(epoch)
-    acc = test_eval.test(args.gpu,net,testloader)
 
-    if args.save:
-        acc_list.append(acc)
+    if (epoch%50)+1>46:
+        acc = test_eval.test(args.gpu, net, testloader, oodloader)
+        w_list.append(utils.save_sample(net, f'{path}/{epoch}.pt'))
 
-end = time()
-
-print('\n==> Final Testing...')
-test_eval.multi_test(args.gpu,net,[net.state_dict()],testloader,oodloader,corrupt=(args.num_class==10))
+    else:
+        # acc = test_eval.test(args.gpu,net,testloader)
+        acc = 0
 
 # report time usage
-minute = (end-start)/60
+minute = (time() - _time) / 60
 if minute<=60:
-    print(f'Finished in {minute:.1f} min')
+    print(f'Training finished in {minute:.1f} min.')
 else:
-    print(f'Finished in {minute/60:.1f} h')
-
-# save acc
-if args.save:
-    torch.save(net.state_dict(),'%s_%d.pt' % (args.save,epoch))
-    np.save('%s_acc.npy' % args.save,np.array(acc_list))
+    print(f'Training finished in {minute/60:.1f} h.')

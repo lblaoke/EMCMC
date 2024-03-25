@@ -1,33 +1,40 @@
+import os
 import sys
 sys.path.append('.')
 
 import torch
-import torch.nn.functional as F
-from torchvision import transforms,datasets
 import numpy as np
-import random
-from time import time
-from tqdm import tqdm
+
 import argparse
+from time import time
+from datetime import datetime
+from tqdm import tqdm
+from math import *
+
+import utils
 import data_loader
 import models
-import utils
-from math import sqrt
+import test_eval
 
 # parse options
 parser = argparse.ArgumentParser()
-parser.add_argument('--data-dir'        , type=str  , default='~'       )
-parser.add_argument('--epoch'           , type=int  , default=200       )
-parser.add_argument('--batch-size'      , type=int  , default=128       )
-parser.add_argument('--gpu'             , type=int  , default=0         )
-parser.add_argument('--seed'            , type=int  , default=None      )
-parser.add_argument('--eta'             , type=float, default=8e-3      )
-parser.add_argument('--lr'              , type=float, default=0.5       )
-parser.add_argument('--decay'           , type=str  , default='cyclical')
-parser.add_argument('--decay-rate'      , type=float, default=0         )
-parser.add_argument('--temperature'     , type=float, default=1e-4      )
-parser.add_argument('--check-point'     , type=str  , default=None      )
-parser.add_argument('--anchor'          , type=int  , default=20        )
+
+parser.add_argument('--data-dir'        , type=str  , default='~'                   )
+parser.add_argument('--save'            , type=str  , default='cifar100_entropy_sgd')
+
+parser.add_argument('--num-class'       , type=int  , default=100                   )
+parser.add_argument('--gpu'             , type=int  , default=0                     )
+parser.add_argument('--seed'            , type=int  , default=None                  )
+
+parser.add_argument('--epoch'           , type=int  , default=200                   )
+parser.add_argument('--batch-size'      , type=int  , default=128                   )
+parser.add_argument('--lr0'             , type=float, default=0.5                   )
+parser.add_argument('--decay-scheme'    , type=str  , default='cyclical'            )
+parser.add_argument('--lr-end'          , type=float, default=0                     )
+parser.add_argument('--temperature'     , type=float, default=1e-4                  )
+parser.add_argument('--eta'             , type=float, default=8e-3                  )
+parser.add_argument('--anchor'          , type=int  , default=20                    )
+
 args = parser.parse_args()
 
 # setup GPU
@@ -35,19 +42,21 @@ utils.GPU_setup(args.gpu,args.seed)
 
 # load data
 print('==> Loading Data...')
-trainloader,testloader = data_loader.cifar(args,num_classes=100)
+trainloader,testloader = data_loader.cifar(args,num_classes=args.num_class)
 oodloader = data_loader.svhn(args)
-val_targets = torch.tensor(testloader.dataset.targets,dtype=torch.int64)
-val_targets_ood = torch.tensor(oodloader.dataset.labels,dtype=torch.int64)
 
 # build model
 print('==> Building Model...')
-net = models.ResNet18(num_classes=100).to(args.gpu)
-net_sampler = models.ResNet18(num_classes=100).to(args.gpu)
-net_mean = models.ResNet18(num_classes=100).to(args.gpu)
+net = models.ResNet18(num_classes=args.num_class)
+net_sampler = models.ResNet18(num_classes=args.num_class)
+net_mean = models.ResNet18(num_classes=args.num_class)
 
-net_sampler = utils.resample(net_sampler,net)
-net_mean = utils.resample(net_mean,net)
+net_sampler = utils.resample(net_sampler, net)
+net_mean = utils.resample(net_mean, net)
+
+net.to(args.gpu)
+net_sampler.to(args.gpu)
+net_mean.to(args.gpu)
 
 def noise(net,coeff):
     _noise = 0
@@ -62,6 +71,7 @@ def reg(net1,net2,coeff):
         _reg += torch.sum(sub*sub*coeff)
     return _reg
 
+# training at each epoch
 def train(epoch):
     print('\nEpoch: %d' % epoch)
     net_sampler.train()
@@ -100,100 +110,44 @@ def train(epoch):
 
     print('Loss: %.3f | ACC: %.3f%% (%d/%d)' % (train_loss/num_batch,100.*correct/total,correct,total))
 
-def test(net,OOD:bool=True):
-    net.eval()
-    output,uncertainty = [],[]
-    output_ood,uncertainty_ood = [],[]
-
-    # test set
-    for _,(inputs,_) in enumerate(testloader):
-        inputs = inputs.to(args.gpu)
-
-        with torch.no_grad():
-            o = net(inputs)
-            u = -torch.sum(F.softmax(o,dim=1)*F.log_softmax(o,dim=1),dim=1)
-
-        output.append(o.detach().cpu())
-        uncertainty.append(u.detach().cpu())
-
-    output = torch.cat(output,dim=0)
-    uncertainty = torch.cat(uncertainty)
-
-    pred = torch.argmax(output,dim=1)
-    correct = (pred==val_targets)
-
-    acc = metric.evaluate(output,correct,val_targets,uncertainty)
-
-    if not OOD:
-        return acc,output
-
-    # OOD set
-    for _,(inputs,_) in enumerate(oodloader):
-        inputs = inputs.to(args.gpu)
-
-        with torch.no_grad():
-            o = net(inputs)
-            u = -torch.sum(F.softmax(o,dim=1)*F.log_softmax(o,dim=1),dim=1)
-
-        output_ood.append(o.detach().cpu())
-        uncertainty_ood.append(u.detach().cpu())
-
-    output_ood = torch.cat(output_ood,dim=0)
-    uncertainty_ood = torch.cat(uncertainty_ood)
-
-    correct = torch.ones_like(val_targets)
-    correct_ood = torch.zeros_like(val_targets_ood)
-
-    metric.evaluate_ood(correct,correct_ood,uncertainty,uncertainty_ood)
-
-    return acc,output,output_ood
+# additional forward to re-compute BatchNorm
+def additional_forward(net):
+    net.train()
+    with torch.no_grad():
+        for _,(inputs,_) in enumerate(trainloader):
+            net(inputs.to(args.gpu))
 
 datasize = 50000
 num_batch = datasize/args.batch_size+1
 M = 4 # number of cycles
 T = args.epoch*num_batch # total number of iterations
 criterion = torch.nn.CrossEntropyLoss()
-opt_sampler = torch.optim.SGD(net_sampler.parameters(),lr=args.lr,weight_decay=5e-4)
-pred_list,pred_list_ood = [],[]
-acc_list = []
+opt_sampler = torch.optim.SGD(net_sampler.parameters(),lr=args.lr0,weight_decay=5e-4)
 
-start = time()
-
+# training loop
 print('==> Training...')
+_time = datetime.now()
+path = f'.checkpoints/{args.save}_{_time.year}_{_time.month}_{_time.day}'
+os.system(f'mkdir -p {path}')
+w_list = []
+
+_time = time()
+
 for epoch in range(args.epoch):
     train(epoch)
+    additional_forward(net)
 
     if (epoch%50)+1>46:
-        net.train()
-        for _,(inputs,_) in enumerate(trainloader):
-            inputs = inputs.to(args.gpu)
-            net(inputs)
+        acc = test_eval.test(args.gpu, net, testloader, oodloader)
+        w_list.append(utils.save_sample(net, f'{path}/{epoch}.pt'))
 
-        acc,pred1,pred1_ood = test(net,OOD=True)
-        pred_list.append(pred1)
-        pred_list_ood.append(pred1_ood)
-        print('Anchor collected!')
     else:
-        print('net:')
-        acc,_ = test(net)
-        print('mean:')
-        test(net_mean)
-        print('sampler:')
-        test(net_sampler)
-
-    if args.check_point is not None:
-        acc_list.append(acc)
-
-end = time()
+        # acc = test_eval.test(args.gpu,net,testloader)
+        acc = 0
 
 # report time usage
-minute = (end-start)/60
+minute = (time() - _time) / 60
 if minute<=60:
-    print(f'Finished in {minute:.1f} min')
+    print(f'Training finished in {minute:.1f} min.')
 else:
-    print(f'Finished in {minute/60:.1f} h')
-
-# save model and acc
-if args.check_point is not None:
-    torch.save(net.state_dict(),'%s_net.pt' % args.check_point)
-    np.save('%s_acc.npy' % args.check_point,np.array(acc_list))
+    print(f'Training finished in {minute/60:.1f} h.')

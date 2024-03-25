@@ -1,18 +1,21 @@
+import os
 import sys
 sys.path.append('.')
 
 import torch
-import torch.nn.functional as F
-from torchvision import transforms,datasets
+from torch.nn.modules.batchnorm import _BatchNorm
 import numpy as np
-import random
-from time import time
-from tqdm import tqdm
+
 import argparse
+from time import time
+from datetime import datetime
+from tqdm import tqdm
+from math import *
+
+import utils
 import data_loader
 import models
-import utils
-from torch.nn.modules.batchnorm import _BatchNorm
+import test_eval
 
 def disable_running_stats(model):
     def _disable(module):
@@ -90,15 +93,20 @@ class SAM(torch.optim.Optimizer):
 
 # parse options
 parser = argparse.ArgumentParser()
-parser.add_argument('--data-dir'        , type=str  , default='~'       )
-parser.add_argument('--epoch'           , type=int  , default=200       )
-parser.add_argument('--batch-size'      , type=int  , default=128       )
-parser.add_argument('--gpu'             , type=int  , default=0         )
-parser.add_argument('--seed'            , type=int  , default=None      )
-parser.add_argument('--lr'              , type=float, default=0.5       )
-parser.add_argument('--decay'           , type=str  , default='cyclical')
-parser.add_argument('--decay-rate'      , type=float, default=0         )
-parser.add_argument('--check-point'     , type=str  , default=None      )
+
+parser.add_argument('--data-dir'        , type=str  , default='~'           )
+parser.add_argument('--save'            , type=str  , default='cifar10_sam' )
+
+parser.add_argument('--num-class'       , type=int  , default=10            )
+parser.add_argument('--gpu'             , type=int  , default=0             )
+parser.add_argument('--seed'            , type=int  , default=None          )
+
+parser.add_argument('--epoch'           , type=int  , default=200           )
+parser.add_argument('--batch-size'      , type=int  , default=128           )
+parser.add_argument('--lr0'             , type=float, default=0.5           )
+parser.add_argument('--decay-scheme'    , type=str  , default='cyclical'    )
+parser.add_argument('--lr-end'          , type=float, default=0             )
+
 args = parser.parse_args()
 
 # setup GPU
@@ -106,13 +114,14 @@ utils.GPU_setup(args.gpu,args.seed)
 
 # load data
 print('==> Loading Data...')
-trainloader,testloader = data_loader.cifar(args,num_classes=100)
+trainloader,testloader = data_loader.cifar(args,num_classes=args.num_class)
 oodloader = data_loader.svhn(args)
 
 # build model
 print('==> Building Model...')
-net = models.ResNet18(num_classes=100).to(args.gpu)
+net = models.ResNet18(num_classes=args.num_class).to(args.gpu)
 
+# training at each epoch
 def train(epoch):
     print('\nEpoch: %d' % epoch)
     net.train()
@@ -148,41 +157,31 @@ T = args.epoch*num_batch # total number of iterations
 criterion = torch.nn.CrossEntropyLoss()
 
 base_opt = torch.optim.SGD
-opt = SAM(net.parameters(),base_opt,lr=args.lr,weight_decay=5e-4)
+opt = SAM(net.parameters(),base_opt,lr=args.lr0,weight_decay=5e-4)
 
-pred_list,pred_list_ood = [],[]
-acc_list = []
-
-start = time()
-
+# training loop
 print('==> Training...')
+_time = datetime.now()
+path = f'.checkpoints/{args.save}_{_time.year}_{_time.month}_{_time.day}'
+os.system(f'mkdir -p {path}')
+w_list = []
+
+_time = time()
+
 for epoch in range(args.epoch):
     train(epoch)
+
     if (epoch%50)+1>46:
-        acc,pred1,pred1_ood = utils.test(args,net,testloader,oodloader,OOD=True)
-        pred_list.append(pred1)
-        pred_list_ood.append(pred1_ood)
-        print('Sampler collected!')
+        acc = test_eval.test(args.gpu, net, testloader, oodloader)
+        w_list.append(utils.save_sample(net, f'{path}/{epoch}.pt'))
 
     else:
-        acc,_ = utils.test(args,net,testloader,oodloader,OOD=False)
-
-    if args.check_point is not None:
-        acc_list.append(acc)
-
-print('==> Final Testing...')
-utils.multi_test(pred_list,pred_list_ood,testloader,oodloader)
-
-end = time()
+        # acc = test_eval.test(args.gpu,net,testloader)
+        acc = 0
 
 # report time usage
-minute = (end-start)/60
+minute = (time() - _time) / 60
 if minute<=60:
-    print(f'Finished in {minute:.1f} min')
+    print(f'Training finished in {minute:.1f} min.')
 else:
-    print(f'Finished in {minute/60:.1f} h')
-
-# save model and acc
-if args.check_point is not None:
-    torch.save(net.state_dict(),'%s_net.pt' % args.check_point)
-    np.save('%s_acc.npy' % args.check_point,np.array(acc_list))
+    print(f'Training finished in {minute/60:.1f} h.')

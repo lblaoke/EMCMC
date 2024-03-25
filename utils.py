@@ -4,7 +4,7 @@ import random
 from math import *
 
 # setup GPU
-def GPU_setup(gpu:int=0,seed:int=None):
+def GPU_setup(gpu:int=0, seed:int=None):
     print('==> Using GPU %d' % gpu)
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
@@ -15,6 +15,24 @@ def GPU_setup(gpu:int=0,seed:int=None):
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
         print('==> Random seed: %d' % seed)
+
+def save_sample(net, path:str):
+    current_device = next(net.parameters()).device
+    net.cpu()
+
+    torch.save(net.state_dict(), path)
+
+    net.to(current_device)
+    return path
+
+def load_sample(net, path:str):
+    current_device = next(net.parameters()).device
+    net.cpu()
+
+    net.load_state_dict(torch.load(path))
+
+    net.to(current_device)
+    return net
 
 # adjust learning rate
 def lr_decay(args,opt,epoch:int,batch_idx:int,num_batch:int,T:int,M:int):
@@ -47,12 +65,12 @@ def lr_decay(args,opt,epoch:int,batch_idx:int,num_batch:int,T:int,M:int):
     return lr
 
 # resample net1 from net2
-def resample(net1,net2,eta:float=0):
+def resample(net1, net2, eta:float=0):
     net1.load_state_dict(net2.state_dict())
 
     if eta>0:
         for param in net1.parameters():
-            param.data += sqrt(eta)*torch.randn_like(param.data)
+            param.data += sqrt(eta) * torch.randn_like(param.data)
     elif eta<0:
         assert False, 'Invalid eta!'
 
